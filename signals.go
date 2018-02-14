@@ -28,13 +28,6 @@ var (
 	idSig  uint64 = 0
 )
 
-type Signal struct {
-	// isCompleted bool
-	id        uint64
-	injector  *ChanInjector
-	Observers map[uint64]Observer
-}
-
 type DisposerList []Disposer
 
 func (dl DisposerList) Dispose() {
@@ -59,11 +52,38 @@ func makeDisposer(sig *Signal) Disposer {
 	return Disposer{id: idDisp, signal: sig}
 }
 
-func (s *Signal) OnNext(side func(value interface{})) *Signal {
-	// return NewSignal(func (obj Injector){
-	// 	s.Sub
-	// })
-	return nil
+type Signal struct {
+	// isCompleted bool
+	id        uint64
+	injector  *ChanInjector
+	Observers map[uint64]Observer
+}
+
+func (s *Signal) On(next NextEvent, failed FailedEvent, completed CompletedEvent) *Signal {
+	return NewSignal(func(obj Injector) {
+		if next != nil {
+			s.ListenNext(func(nextValue interface{}) {
+				next(nextValue)
+				obj.SendNext(nextValue)
+			})
+		}
+		if failed != nil {
+			s.ListenFailed(func(err error) {
+				failed(err)
+				obj.SendFailed(err)
+			})
+		}
+		if completed != nil {
+			s.ListenCompleted(func(completedValue bool) {
+				completed(completedValue)
+				obj.SendCompleted()
+			})
+		}
+	})
+}
+
+func (s *Signal) OnNext(side NextEvent) *Signal {
+	return s.On(side, nil, nil)
 }
 
 func (s *Signal) Map(transformer func(value interface{}) (interface{}, error)) *Signal {
@@ -72,6 +92,7 @@ func (s *Signal) Map(transformer func(value interface{}) (interface{}, error)) *
 		newValue, err := transformer(next)
 		if err != nil {
 			pipe.Injector.SendFailed(err)
+			return
 		}
 		pipe.Injector.SendNext(newValue)
 
