@@ -2,6 +2,7 @@ package goreact
 
 import (
 	"log"
+	"sync"
 )
 
 // "log"
@@ -57,29 +58,27 @@ type Signal struct {
 	id        uint64
 	injector  *ChanInjector
 	Observers map[uint64]Observer
+	mutex     sync.Mutex
 }
 
 func (s *Signal) On(next NextEvent, failed FailedEvent, completed CompletedEvent) *Signal {
-	return NewSignal(func(obj Injector) {
-		if next != nil {
-			s.ListenNext(func(nextValue interface{}) {
-				next(nextValue)
-				obj.SendNext(nextValue)
-			})
-		}
-		if failed != nil {
-			s.ListenFailed(func(err error) {
-				failed(err)
-				obj.SendFailed(err)
-			})
-		}
-		if completed != nil {
-			s.ListenCompleted(func(completedValue bool) {
-				completed(completedValue)
-				obj.SendCompleted()
-			})
-		}
-	})
+
+	if next != nil {
+		s.ListenNext(func(nextValue interface{}) {
+			next(nextValue)
+		})
+	}
+	if failed != nil {
+		s.ListenFailed(func(err error) {
+			failed(err)
+		})
+	}
+	if completed != nil {
+		s.ListenCompleted(func(completedValue bool) {
+			completed(completedValue)
+		})
+	}
+	return s
 }
 
 func (s *Signal) OnNext(side NextEvent) *Signal {
@@ -156,13 +155,17 @@ L:
 }
 
 func (s *Signal) sendNext(v interface{}) {
-
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 	for _, obs := range s.Observers {
 		obs.SendNext(v)
 	}
 }
 
 func (s *Signal) sendCompleted() {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
 	for _, obs := range s.Observers {
 		obs.SendCompleted()
 	}
@@ -171,6 +174,9 @@ func (s *Signal) sendCompleted() {
 }
 
 func (s *Signal) sendFailed(err error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
 	for _, obs := range s.Observers {
 		obs.SendFailed(err)
 	}
@@ -178,14 +184,21 @@ func (s *Signal) sendFailed(err error) {
 
 func (s *Signal) ListenNext(next NextEvent) Disposer {
 	// log.Println("add listen next :", next)
+
 	cObs := Observe{next: next}
 	disp := makeDisposer(s)
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
 	s.Observers[disp.id] = cObs
 	return disp
 }
 func (s *Signal) ListenFailed(failed FailedEvent) Disposer {
 	cObs := Observe{failed: failed}
 	disp := makeDisposer(s)
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
 	s.Observers[disp.id] = cObs
 	return disp
 
@@ -193,6 +206,9 @@ func (s *Signal) ListenFailed(failed FailedEvent) Disposer {
 func (s *Signal) ListenCompleted(completed CompletedEvent) Disposer {
 	cObs := Observe{completed: completed}
 	disp := makeDisposer(s)
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
 	s.Observers[disp.id] = cObs
 	return disp
 
@@ -201,6 +217,8 @@ func (s *Signal) ListenCompleted(completed CompletedEvent) Disposer {
 func (s *Signal) Listen(next NextEvent, failed FailedEvent, completed CompletedEvent) Disposer {
 	cObs := Observe{next: next, failed: failed, completed: completed}
 	disp := makeDisposer(s)
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 	s.Observers[disp.id] = cObs
 	return disp
 
@@ -209,7 +227,7 @@ func (s *Signal) Listen(next NextEvent, failed FailedEvent, completed CompletedE
 func NewEmptySignal() *Signal {
 	i := NewChanInjector()
 	o := make(map[uint64]Observer, 0)
-	s := &Signal{injector: i, Observers: o}
+	s := &Signal{injector: i, Observers: o, mutex: sync.Mutex{}}
 	s.id = idSig
 	idSig++
 	go s.run()
@@ -230,7 +248,7 @@ type Pipe struct {
 func NewPipe() Pipe {
 	i := NewChanInjector()
 	o := make(map[uint64]Observer, 0)
-	s := &Signal{injector: i, Observers: o}
+	s := &Signal{injector: i, Observers: o, mutex: sync.Mutex{}}
 	s.id = idSig
 	idSig++
 	go s.run()
