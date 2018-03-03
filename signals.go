@@ -189,19 +189,19 @@ func (s *Signal) sendFailed(err error) {
 
 func (s *Signal) ListenNext(next NextEvent) Disposer {
 	// log.Println("add listen next :", next)
-
-	cObs := Observe{next: next}
-	disp := makeDisposer(s)
-	s.Observers[disp.id] = cObs
+disp := makeDisposer(s)
+	cObs := Observe{next: next, id: disp.id}
+	
+	s.subscribe <- cObs
 	return disp
 }
 func (s *Signal) ListenFailed(failed FailedEvent) Disposer {
-	cObs := Observe{failed: failed}
 	disp := makeDisposer(s)
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	cObs := Observe{failed: failed, id:disp.id}
+	
 
-	s.Observers[disp.id] = cObs
+
+	s.subscribe <- cObs
 	return disp
 
 }
