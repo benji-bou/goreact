@@ -39,18 +39,18 @@ func (dl DisposerList) Dispose() {
 
 type Disposer struct {
 	id     uint64
-	signal *Signal
+	 unsubscribe chan<- uint64
 }
 
 func (d Disposer) Dispose() {
-	if d.signal != nil {
-		delete(d.signal.Observers, d.id)
+	if d.unsubscribe != nil {
+	    d.unsubscribe <- d.id
 	}
 }
 
 func makeDisposer(sig *Signal) Disposer {
 	idDisp++
-	return Disposer{id: idDisp, signal: sig}
+	return Disposer{id: idDisp, unsubscribe: sig.unsubscribe}
 }
 
 type Signal struct {
@@ -58,7 +58,8 @@ type Signal struct {
 	id        uint64
 	injector  *ChanInjector
 	Observers map[uint64]Observer
-	mutex     sync.Mutex
+	subscribe chan Observer
+	unsubscribe chan uint64
 }
 
 func (s *Signal) On(next NextEvent, failed FailedEvent, completed CompletedEvent) *Signal {
@@ -149,34 +150,38 @@ L:
 			}
 			s.sendCompleted()
 			break L
+		case obs, ok := <- s.subscribe :
+			if ok == false {
+				log.Println("BREAK---completed", s.id)
+				break L
+			}
+			s.observers[obs.id] = obs
+		case idObs, ok := <- s.unsubscribe:
+			
+		if ok == false {
+				log.Println("BREAK---completed", s.id)
+				break L
+			}
+		delete(s.observers, idObs)
 		}
 	}
 	log.Println("*******END OF RUN*********", s.id)
 }
 
 func (s *Signal) sendNext(v interface{}) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
 	for _, obs := range s.Observers {
 		obs.SendNext(v)
 	}
 }
 
 func (s *Signal) sendCompleted() {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
 	for _, obs := range s.Observers {
 		obs.SendCompleted()
 	}
 	s.Observers = map[uint64]Observer{}
-	s.injector.Close()
 }
 
 func (s *Signal) sendFailed(err error) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
 	for _, obs := range s.Observers {
 		obs.SendFailed(err)
 	}
@@ -187,9 +192,6 @@ func (s *Signal) ListenNext(next NextEvent) Disposer {
 
 	cObs := Observe{next: next}
 	disp := makeDisposer(s)
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
 	s.Observers[disp.id] = cObs
 	return disp
 }
