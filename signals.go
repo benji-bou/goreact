@@ -2,6 +2,8 @@ package goreact
 
 import (
 	"log"
+
+	uuid "github.com/satori/go.uuid"
 )
 
 // "log"
@@ -10,6 +12,10 @@ type NextEvent func(v interface{})
 type FailedEvent func(err error)
 type CompletedEvent func(completed bool)
 
+type NextEventWithMeta func(v interface{}, metas ...interface{})
+type FailedEventWithMeta func(err error, metas ...interface{})
+type CompletedEventWithMeta func(completed bool, metas ...interface{})
+
 type Injector interface {
 	SendFailed(err error)
 	SendNext(value interface{})
@@ -17,17 +23,12 @@ type Injector interface {
 }
 
 type Observer interface {
-	GetId() uint64
+	GetId() uuid.UUID
 	Injector
 	// ListenNext(next NextEvent)
 	// ListenFailed(failed FailedEvent)
 	// ListenCompleted(completed CompletedEvent)
 }
-
-var (
-	idDisp uint64 = 0
-	idSig  uint64 = 0
-)
 
 type DisposerList []Disposer
 
@@ -38,8 +39,8 @@ func (dl DisposerList) Dispose() {
 }
 
 type Disposer struct {
-	id          uint64
-	unsubscribe chan<- uint64
+	id          uuid.UUID
+	unsubscribe chan<- uuid.UUID
 }
 
 func (d Disposer) Dispose() {
@@ -49,17 +50,16 @@ func (d Disposer) Dispose() {
 }
 
 func makeDisposer(sig *Signal) Disposer {
-	idDisp++
-	return Disposer{id: idDisp, unsubscribe: sig.unsubscribe}
+	return Disposer{id: uuid.NewV1(), unsubscribe: sig.unsubscribe}
 }
 
 type Signal struct {
 	// isCompleted bool
 	id          uint64
 	injector    *ChanInjector
-	observers   map[uint64]Observer
+	observers   map[uuid.UUID]Observer
 	subscribe   chan Observer
-	unsubscribe chan uint64
+	unsubscribe chan uuid.UUID
 }
 
 func (s *Signal) run() {
@@ -113,7 +113,7 @@ func (s *Signal) sendCompleted() {
 	for _, obs := range s.observers {
 		obs.SendCompleted()
 	}
-	s.observers = map[uint64]Observer{}
+	s.observers = map[uuid.UUID]Observer{}
 }
 
 func (s *Signal) sendFailed(err error) {
@@ -126,14 +126,12 @@ func (s *Signal) ListenNext(next NextEvent) Disposer {
 	// log.Println("add listen next :", next)
 	disp := makeDisposer(s)
 	cObs := Observe{next: next, id: disp.id}
-
 	s.subscribe <- cObs
 	return disp
 }
 func (s *Signal) ListenFailed(failed FailedEvent) Disposer {
 	disp := makeDisposer(s)
 	cObs := Observe{failed: failed, id: disp.id}
-
 	s.subscribe <- cObs
 	return disp
 
@@ -153,12 +151,42 @@ func (s *Signal) Listen(next NextEvent, failed FailedEvent, completed CompletedE
 	return disp
 }
 
+func (s *Signal) ListenNextWithMeta(next NextEventWithMeta, metas ...interface{}) Disposer {
+	// log.Println("add listen next :", next)
+	disp := makeDisposer(s)
+	cObs := MetaObserve{next: next, id: disp.id, metas: metas}
+	s.subscribe <- cObs
+	return disp
+}
+func (s *Signal) ListenFailedWithMeta(failed FailedEventWithMeta, metas ...interface{}) Disposer {
+	disp := makeDisposer(s)
+	cObs := MetaObserve{failed: failed, id: disp.id, metas: metas}
+
+	s.subscribe <- cObs
+	return disp
+
+}
+func (s *Signal) ListenCompletedWithMeta(completed CompletedEventWithMeta, metas ...interface{}) Disposer {
+	disp := makeDisposer(s)
+	cObs := MetaObserve{completed: completed, id: disp.id, metas: metas}
+	s.subscribe <- cObs
+	return disp
+
+}
+
+func (s *Signal) ListenWithMeta(next NextEventWithMeta, failed FailedEventWithMeta, completed CompletedEventWithMeta, metas ...interface{}) Disposer {
+	disp := makeDisposer(s)
+	cObs := MetaObserve{next: next, failed: failed, completed: completed, id: disp.id, metas: metas}
+	s.subscribe <- cObs
+	return disp
+}
+
 func NewEmptySignal() *Signal {
 	i := NewChanInjector()
-	o := make(map[uint64]Observer, 0)
-	s := &Signal{injector: i, observers: o}
-	s.id = idSig
-	idSig++
+	o := make(map[uuid.UUID]Observer, 0)
+	chSub := make(chan Observer)
+	chUnSub := make(chan uuid.UUID)
+	s := &Signal{injector: i, observers: o, subscribe: chSub, unsubscribe: chUnSub}
 	go s.run()
 	return s
 }
@@ -176,10 +204,10 @@ type Pipe struct {
 
 func NewPipe() Pipe {
 	i := NewChanInjector()
-	o := make(map[uint64]Observer, 0)
-	s := &Signal{injector: i, observers: o}
-	s.id = idSig
-	idSig++
+	o := make(map[uuid.UUID]Observer, 0)
+	chSub := make(chan Observer)
+	chUnSub := make(chan uuid.UUID)
+	s := &Signal{injector: i, observers: o, subscribe: chSub, unsubscribe: chUnSub}
 	go s.run()
 	return Pipe{Signal: s, Injector: i}
 }
@@ -223,36 +251,7 @@ func (i *ChanInjector) SendCompleted() {
 	}
 }
 
-type Observe struct {
-	id        uint64
-	next      NextEvent
-	failed    FailedEvent
-	completed CompletedEvent
-}
 
-func (o Observe) GetId() uint64 {
-	return o.id
-}
-
-func (o Observe) SendFailed(err error) {
-	if o.failed != nil {
-		o.failed(err)
-	}
-}
-
-func (o Observe) SendNext(value interface{}) {
-	if o.next != nil {
-		o.next(value)
-	}
-
-}
-
-func (o Observe) SendCompleted() {
-	if o.completed != nil {
-		o.completed(true)
-	}
-
-}
 
 //Operators
 func (s *Signal) On(next NextEvent, failed FailedEvent, completed CompletedEvent) *Signal {
@@ -299,7 +298,7 @@ func (s *Signal) Map(transformer func(value interface{}) (interface{}, error)) *
 	return pipe.Signal
 }
 
-func (s *Signal) Merge(inners ...*Signal) *Signal {
+func Merge(inners ...*Signal) *Signal {
 	pipe := NewPipe()
 	for _, inner := range inners {
 		inner.Listen(func(event interface{}) {
@@ -310,12 +309,28 @@ func (s *Signal) Merge(inners ...*Signal) *Signal {
 			pipe.Injector.SendCompleted()
 		})
 	}
-	s.Listen(func(event interface{}) {
-		pipe.Injector.SendNext(event)
-	}, func(err error) {
-		pipe.Injector.SendFailed(err)
-	}, func(completed bool) {
-		pipe.Injector.SendCompleted()
-	})
 	return pipe.Signal
+}
+
+func (s *Signal) Merge(inners ...*Signal) *Signal {
+	all := append(inners, s)
+	return Merge(all...)
+}
+
+func (s *Signal) Filter(filter func(value interface{}) (include bool)) *Signal {
+	return NewSignal(func(obs Injector) {
+		sig := s
+		sig.ListenNext(func(next interface{}) {
+			if filter(next) == true {
+				obs.SendNext(next)
+			}
+		})
+		sig.ListenFailed(func(err error) {
+			obs.SendFailed(err)
+		})
+		sig.ListenCompleted(func(completed bool) {
+			obs.SendCompleted()
+		})
+	})
+
 }
