@@ -251,8 +251,6 @@ func (i *ChanInjector) SendCompleted() {
 	}
 }
 
-
-
 //Operators
 func (s *Signal) On(next NextEvent, failed FailedEvent, completed CompletedEvent) *Signal {
 
