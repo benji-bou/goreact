@@ -191,9 +191,9 @@ func NewEmptySignal() *Signal {
 	return s
 }
 
-func NewSignal(generator func(obs Injector)) *Signal {
+func NewSignal(generator func(obs Injector, meta ...interface{}), meta ...interface{}) *Signal {
 	s := NewEmptySignal()
-	go generator(s.injector)
+	go generator(s.injector, meta)
 	return s
 }
 
