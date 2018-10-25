@@ -191,9 +191,15 @@ func NewEmptySignal() *Signal {
 	return s
 }
 
-func NewSignal(generator func(obs Injector, meta ...interface{}), meta ...interface{}) *Signal {
+func NewSignalWithMeta(generator func(obs Injector, meta ...interface{}), meta ...interface{}) *Signal {
 	s := NewEmptySignal()
-	go generator(s.injector, meta)
+	go generator(s.injector, meta...)
+	return s
+}
+
+func NewSignal(generator func(obs Injector)) *Signal {
+	s := NewEmptySignal()
+	go generator(s.injector)
 	return s
 }
 
