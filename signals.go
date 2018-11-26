@@ -50,7 +50,8 @@ func (d Disposer) Dispose() {
 }
 
 func makeDisposer(sig *Signal) Disposer {
-	return Disposer{id: uuid.NewV1(), unsubscribe: sig.unsubscribe}
+	id, _ := uuid.NewV1()
+	return Disposer{id: id, unsubscribe: sig.unsubscribe}
 }
 
 type Signal struct {
