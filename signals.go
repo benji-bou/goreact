@@ -30,6 +30,62 @@ type Observer interface {
 	// ListenCompleted(completed CompletedEvent)
 }
 
+type BagDisposer struct {
+	disposers DisposerList
+	add       chan Disposer
+	dispose   chan struct{}
+}
+
+func MakeBagDisposer() BagDisposer {
+	bag := BagDisposer{disposers: DisposerList{}, add: make(chan Disposer), dispose: make(chan struct{})}
+	go func(bag BagDisposer) {
+		for {
+			select {
+			case disp := <-bag.add:
+				bag.disposers = append(bag.disposers, disp)
+			case <-bag.dispose:
+				bag.disposers.Dispose()
+				bag.disposers = DisposerList{}
+			}
+		}
+	}(bag)
+	return bag
+}
+
+func (bag BagDisposer) Dispose() {
+	bag.dispose <- struct{}{}
+}
+
+func (bag BagDisposer) Add(disps ...Disposer) {
+	for _, disp := range disps {
+		bag.add <- disp
+	}
+}
+
+type SingleBagDisposer struct {
+	BagDisposer
+	hasBeenDisposed bool
+}
+
+func MakeSingleBagDisposer() SingleBagDisposer {
+	singleBag := SingleBagDisposer{BagDisposer: BagDisposer{disposers: DisposerList{}, add: make(chan Disposer), dispose: make(chan struct{})}, hasBeenDisposed: false}
+	go func(sbag SingleBagDisposer) {
+		for {
+			select {
+			case disp := <-sbag.add:
+				if sbag.hasBeenDisposed == false {
+					sbag.disposers = append(sbag.disposers, disp)
+				}
+			case <-sbag.dispose:
+				sbag.disposers.Dispose()
+				sbag.disposers = DisposerList{}
+				sbag.hasBeenDisposed = true
+			}
+		}
+	}(singleBag)
+	return singleBag
+}
+
 type DisposerList []Disposer
 
 func (dl DisposerList) Dispose() {
@@ -73,6 +129,7 @@ L:
 				break L
 			}
 			s.sendFailed(err)
+			break L
 		case next, ok := <-s.injector.next:
 			if ok == false {
 				log.Println("BREAK---next", s.id)
@@ -121,6 +178,7 @@ func (s *Signal) sendFailed(err error) {
 	for _, obs := range s.observers {
 		obs.SendFailed(err)
 	}
+	s.observers = map[uuid.UUID]Observer{}
 }
 
 func (s *Signal) ListenNext(next NextEvent) Disposer {
