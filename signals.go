@@ -8,37 +8,40 @@ import (
 
 // "log"
 
-type NextEvent func(v interface{})
-type FailedEvent func(err error)
-type CompletedEvent func(completed bool)
-
-type NextEventWithMeta func(v interface{}, metas ...interface{})
-type FailedEventWithMeta func(err error, metas ...interface{})
-type CompletedEventWithMeta func(completed bool, metas ...interface{})
-
 type Injector interface {
 	SendFailed(err error)
 	SendNext(value interface{})
 	SendCompleted()
 }
 
-type Observer interface {
-	GetId() uuid.UUID
-	Injector
-	// ListenNext(next NextEvent)
-	// ListenFailed(failed FailedEvent)
-	// ListenCompleted(completed CompletedEvent)
+type Disposable interface {
+	Dispose()
 }
 
-type BagDisposer struct {
+type ReusableBagDisposer struct {
 	disposers DisposerList
-	add       chan Disposer
+	add       chan Disposable
 	dispose   chan struct{}
 }
 
-func MakeBagDisposer() BagDisposer {
-	bag := BagDisposer{disposers: DisposerList{}, add: make(chan Disposer), dispose: make(chan struct{})}
-	go func(bag BagDisposer) {
+type DisposerWithAction struct {
+	Disposable
+	action func()
+}
+
+func MakeDisposerWithAction(s *Signal, action func()) DisposerWithAction {
+	disp, _ := makeDisposer(s)
+	return DisposerWithAction{Disposable: disp, action: action}
+}
+
+func (dwa DisposerWithAction) Dispose() {
+	dwa.action()
+	dwa.Disposable.Dispose()
+}
+
+func MakeReusableBagDisposer() ReusableBagDisposer {
+	bag := ReusableBagDisposer{disposers: DisposerList{}, add: make(chan Disposable), dispose: make(chan struct{})}
+	go func(bag ReusableBagDisposer) {
 		for {
 			select {
 			case disp := <-bag.add:
@@ -52,24 +55,26 @@ func MakeBagDisposer() BagDisposer {
 	return bag
 }
 
-func (bag BagDisposer) Dispose() {
+func (bag ReusableBagDisposer) Dispose() {
 	bag.dispose <- struct{}{}
 }
 
-func (bag BagDisposer) Add(disps ...Disposer) {
+func (bag ReusableBagDisposer) Add(disps ...Disposable) {
 	for _, disp := range disps {
-		bag.add <- disp
+		if disp != nil {
+			bag.add <- disp
+		}
 	}
 }
 
-type SingleBagDisposer struct {
-	BagDisposer
+type BagDisposer struct {
+	ReusableBagDisposer
 	hasBeenDisposed bool
 }
 
-func MakeSingleBagDisposer() SingleBagDisposer {
-	singleBag := SingleBagDisposer{BagDisposer: BagDisposer{disposers: DisposerList{}, add: make(chan Disposer), dispose: make(chan struct{})}, hasBeenDisposed: false}
-	go func(sbag SingleBagDisposer) {
+func MakeBagDisposer() BagDisposer {
+	singleBag := BagDisposer{ReusableBagDisposer: ReusableBagDisposer{disposers: DisposerList{}, add: make(chan Disposable), dispose: make(chan struct{})}, hasBeenDisposed: false}
+	go func(sbag BagDisposer) {
 		for {
 			select {
 			case disp := <-sbag.add:
@@ -86,7 +91,7 @@ func MakeSingleBagDisposer() SingleBagDisposer {
 	return singleBag
 }
 
-type DisposerList []Disposer
+type DisposerList []Disposable
 
 func (dl DisposerList) Dispose() {
 	for _, d := range dl {
@@ -105,9 +110,12 @@ func (d Disposer) Dispose() {
 	}
 }
 
-func makeDisposer(sig *Signal) Disposer {
+func makeDisposer(sig *Signal) (BagDisposer, uuid.UUID) {
 	id, _ := uuid.NewV1()
-	return Disposer{id: id, unsubscribe: sig.unsubscribe}
+	disp := Disposer{id: id, unsubscribe: sig.unsubscribe}
+	bag := MakeBagDisposer()
+	bag.Add(disp)
+	return bag, id
 }
 
 type Signal struct {
@@ -117,6 +125,7 @@ type Signal struct {
 	observers   map[uuid.UUID]Observer
 	subscribe   chan Observer
 	unsubscribe chan uuid.UUID
+	stop        chan struct{}
 }
 
 func (s *Signal) run() {
@@ -156,9 +165,20 @@ L:
 				break L
 			}
 			delete(s.observers, idObs)
+		case <-s.stop:
+			break L
 		}
 	}
+	s.observers = map[uuid.UUID]Observer{}
 	log.Println("*******END OF RUN*********", s.id)
+}
+
+func (s *Signal) stopSignal() {
+	select {
+	case s.stop <- struct{}{}:
+	default:
+	}
+	s.injector.close()
 }
 
 func (s *Signal) sendNext(v interface{}) {
@@ -181,61 +201,61 @@ func (s *Signal) sendFailed(err error) {
 	s.observers = map[uuid.UUID]Observer{}
 }
 
-func (s *Signal) ListenNext(next NextEvent) Disposer {
+func (s *Signal) ListenNext(next NextEvent) Disposable {
 	// log.Println("add listen next :", next)
-	disp := makeDisposer(s)
-	cObs := Observe{next: next, id: disp.id}
+	disp, id := makeDisposer(s)
+	cObs := Observe{next: next, id: id, timeline: disp}
 	s.subscribe <- cObs
 	return disp
 }
-func (s *Signal) ListenFailed(failed FailedEvent) Disposer {
-	disp := makeDisposer(s)
-	cObs := Observe{failed: failed, id: disp.id}
-	s.subscribe <- cObs
-	return disp
-
-}
-func (s *Signal) ListenCompleted(completed CompletedEvent) Disposer {
-	disp := makeDisposer(s)
-	cObs := Observe{completed: completed, id: disp.id}
+func (s *Signal) ListenFailed(failed FailedEvent) Disposable {
+	disp, id := makeDisposer(s)
+	cObs := Observe{failed: failed, id: id, timeline: disp}
 	s.subscribe <- cObs
 	return disp
 
 }
+func (s *Signal) ListenCompleted(completed CompletedEvent) Disposable {
+	disp, id := makeDisposer(s)
+	cObs := Observe{completed: completed, id: id, timeline: disp}
+	s.subscribe <- cObs
+	return disp
 
-func (s *Signal) Listen(next NextEvent, failed FailedEvent, completed CompletedEvent) Disposer {
-	disp := makeDisposer(s)
-	cObs := Observe{next: next, failed: failed, completed: completed, id: disp.id}
+}
+
+func (s *Signal) Listen(next NextEvent, failed FailedEvent, completed CompletedEvent) Disposable {
+	disp, id := makeDisposer(s)
+	cObs := Observe{next: next, failed: failed, completed: completed, id: id, timeline: disp}
 	s.subscribe <- cObs
 	return disp
 }
 
-func (s *Signal) ListenNextWithMeta(next NextEventWithMeta, metas ...interface{}) Disposer {
+func (s *Signal) ListenNextWithMeta(next NextEventWithMeta, metas ...interface{}) Disposable {
 	// log.Println("add listen next :", next)
-	disp := makeDisposer(s)
-	cObs := MetaObserve{next: next, id: disp.id, metas: metas}
+	disp, id := makeDisposer(s)
+	cObs := MetaObserve{next: next, id: id, metas: metas, timeline: disp}
 	s.subscribe <- cObs
 	return disp
 }
-func (s *Signal) ListenFailedWithMeta(failed FailedEventWithMeta, metas ...interface{}) Disposer {
-	disp := makeDisposer(s)
-	cObs := MetaObserve{failed: failed, id: disp.id, metas: metas}
+func (s *Signal) ListenFailedWithMeta(failed FailedEventWithMeta, metas ...interface{}) Disposable {
+	disp, id := makeDisposer(s)
+	cObs := MetaObserve{failed: failed, id: id, metas: metas, timeline: disp}
 
-	s.subscribe <- cObs
-	return disp
-
-}
-func (s *Signal) ListenCompletedWithMeta(completed CompletedEventWithMeta, metas ...interface{}) Disposer {
-	disp := makeDisposer(s)
-	cObs := MetaObserve{completed: completed, id: disp.id, metas: metas}
 	s.subscribe <- cObs
 	return disp
 
 }
+func (s *Signal) ListenCompletedWithMeta(completed CompletedEventWithMeta, metas ...interface{}) Disposable {
+	disp, id := makeDisposer(s)
+	cObs := MetaObserve{completed: completed, id: id, metas: metas, timeline: disp}
+	s.subscribe <- cObs
+	return disp
 
-func (s *Signal) ListenWithMeta(next NextEventWithMeta, failed FailedEventWithMeta, completed CompletedEventWithMeta, metas ...interface{}) Disposer {
-	disp := makeDisposer(s)
-	cObs := MetaObserve{next: next, failed: failed, completed: completed, id: disp.id, metas: metas}
+}
+
+func (s *Signal) ListenWithMeta(next NextEventWithMeta, failed FailedEventWithMeta, completed CompletedEventWithMeta, metas ...interface{}) Disposable {
+	disp, id := makeDisposer(s)
+	cObs := MetaObserve{next: next, failed: failed, completed: completed, id: id, metas: metas, timeline: disp}
 	s.subscribe <- cObs
 	return disp
 }
@@ -252,13 +272,19 @@ func NewEmptySignal() *Signal {
 
 func NewSignalWithMeta(generator func(obs Injector, meta ...interface{}), meta ...interface{}) *Signal {
 	s := NewEmptySignal()
-	go generator(s.injector, meta...)
+	go func(generator func(obs Injector, meta ...interface{}), s *Signal, meta ...interface{}) {
+		generator(s.injector, meta...)
+		s.stopSignal()
+	}(generator, s, meta)
 	return s
 }
 
 func NewSignal(generator func(obs Injector)) *Signal {
 	s := NewEmptySignal()
-	go generator(s.injector)
+	go func(generator func(obs Injector), s *Signal) {
+		generator(s.injector)
+		s.stopSignal()
+	}(generator, s)
 	return s
 }
 
@@ -291,7 +317,7 @@ func NewChanInjector() *ChanInjector {
 	return &ChanInjector{isAvailable: true, failed: errc, next: nextc, completed: completedc}
 }
 
-func (i *ChanInjector) Close() {
+func (i *ChanInjector) close() {
 	i.isAvailable = false
 	close(i.failed)
 	close(i.next)
@@ -320,18 +346,18 @@ func (i *ChanInjector) SendCompleted() {
 func (s *Signal) On(next NextEvent, failed FailedEvent, completed CompletedEvent) *Signal {
 
 	if next != nil {
-		s.ListenNext(func(nextValue interface{}) {
-			next(nextValue)
+		s.ListenNext(func(nextValue interface{}) Disposable {
+			return next(nextValue)
 		})
 	}
 	if failed != nil {
-		s.ListenFailed(func(err error) {
-			failed(err)
+		s.ListenFailed(func(err error) Disposable {
+			return failed(err)
 		})
 	}
 	if completed != nil {
-		s.ListenCompleted(func(completedValue bool) {
-			completed(completedValue)
+		s.ListenCompleted(func(completedValue bool) Disposable {
+			return completed(completedValue)
 		})
 	}
 	return s
@@ -343,34 +369,45 @@ func (s *Signal) OnNext(side NextEvent) *Signal {
 
 func (s *Signal) Map(transformer func(value interface{}) (interface{}, error)) *Signal {
 	pipe := NewPipe()
-	s.ListenNext(func(next interface{}) {
+	s.ListenNext(func(next interface{}) Disposable {
 		newValue, err := transformer(next)
 		if err != nil {
 			pipe.Injector.SendFailed(err)
-			return
+			return nil
 		}
 		pipe.Injector.SendNext(newValue)
-
+		return nil
 	})
-	s.ListenFailed(func(err error) {
+	s.ListenFailed(func(err error) Disposable {
 		pipe.Injector.SendFailed(err)
+		return nil
 	})
-	s.ListenCompleted(func(completed bool) {
+	s.ListenCompleted(func(completed bool) Disposable {
 		pipe.Injector.SendCompleted()
+		return nil
 	})
 	return pipe.Signal
 }
 
 func Merge(inners ...*Signal) *Signal {
 	pipe := NewPipe()
+	count := len(inners)
+	var bag BagDisposer = MakeBagDisposer()
 	for _, inner := range inners {
-		inner.Listen(func(event interface{}) {
+		sig := inner.Listen(func(event interface{}) Disposable {
 			pipe.Injector.SendNext(event)
-		}, func(err error) {
+			return nil
+		}, func(err error) Disposable {
 			pipe.Injector.SendFailed(err)
-		}, func(completed bool) {
-			pipe.Injector.SendCompleted()
+			return nil
+		}, func(completed bool) Disposable {
+			count--
+			if count == 0 {
+				pipe.Injector.SendCompleted()
+			}
+			return nil
 		})
+		bag.Add(sig)
 	}
 	return pipe.Signal
 }
@@ -382,12 +419,29 @@ func (s *Signal) Merge(inners ...*Signal) *Signal {
 
 func (s *Signal) Filter(filter func(value interface{}) (include bool)) *Signal {
 	return NewSignal(func(obs Injector) {
-		sig := s
-		sig.ListenNext(func(next interface{}) {
+		s.ListenNext(func(next interface{}) Disposable {
 			if filter(next) == true {
 				obs.SendNext(next)
 			}
 		})
+		s.ListenFailed(func(err error) Disposable {
+			obs.SendFailed(err)
+		})
+		s.ListenCompleted(func(completed bool) Disposable {
+			obs.SendCompleted()
+		})
+	})
+
+}
+
+func (s *Signal) FlatMap(mapping func(value interface{}) *Signal) *Signal {
+	return NewSignal(func(obs Injector) {
+		sig := s
+		sig.ListenNext(func(next interface{}) {
+			sig := mapping(next)
+			sig.LI
+		})
+
 		sig.ListenFailed(func(err error) {
 			obs.SendFailed(err)
 		})
