@@ -125,7 +125,7 @@ type Signal struct {
 	observers   map[uuid.UUID]Observer
 	subscribe   chan Observer
 	unsubscribe chan uuid.UUID
-	stop        chan struct{}
+	done        chan struct{}
 }
 
 func (s *Signal) run() {
@@ -165,20 +165,21 @@ L:
 				break L
 			}
 			delete(s.observers, idObs)
-		case <-s.stop:
-			break L
 		}
 	}
+	s.sendTerminated()
 	s.observers = map[uuid.UUID]Observer{}
 	log.Println("*******END OF RUN*********", s.id)
 }
 
 func (s *Signal) stopSignal() {
-	select {
-	case s.stop <- struct{}{}:
-	default:
-	}
 	s.injector.close()
+}
+
+func (s *Signal) sendTerminated() {
+	for _, obs := range s.observers {
+		obs.SendTerminated()
+	}
 }
 
 func (s *Signal) sendNext(v interface{}) {
@@ -220,7 +221,13 @@ func (s *Signal) ListenCompleted(completed CompletedEvent) Disposable {
 	cObs := Observe{completed: completed, id: id, timeline: disp}
 	s.subscribe <- cObs
 	return disp
+}
 
+func (s *Signal) ListenTerminated(terminated TerminatedEvent) Disposable {
+	disp, id := makeDisposer(s)
+	cObs := Observe{terminated: terminated, id: id, timeline: disp}
+	s.subscribe <- cObs
+	return disp
 }
 
 func (s *Signal) Listen(next NextEvent, failed FailedEvent, completed CompletedEvent) Disposable {
@@ -417,37 +424,76 @@ func (s *Signal) Merge(inners ...*Signal) *Signal {
 	return Merge(all...)
 }
 
+func SafelyListeningSignals(s *Signal, action func(bag BagDisposer)) {
+	done := make(chan struct{})
+	bag := MakeBagDisposer()
+	dispTerminated := s.ListenTerminated(func() Disposable {
+		done <- struct{}{}
+		return nil
+	})
+	bag.Add(dispTerminated)
+	action(bag)
+	<-done
+	bag.Dispose()
+
+}
+
 func (s *Signal) Filter(filter func(value interface{}) (include bool)) *Signal {
 	return NewSignal(func(obs Injector) {
-		s.ListenNext(func(next interface{}) Disposable {
-			if filter(next) == true {
-				obs.SendNext(next)
-			}
-		})
-		s.ListenFailed(func(err error) Disposable {
-			obs.SendFailed(err)
-		})
-		s.ListenCompleted(func(completed bool) Disposable {
-			obs.SendCompleted()
+		SafelyListeningSignals(s, func(bag BagDisposer) {
+			disp := s.Listen(func(next interface{}) Disposable {
+				if filter(next) == true {
+					obs.SendNext(next)
+				}
+				return nil
+			}, func(err error) Disposable {
+				obs.SendFailed(err)
+				return nil
+			}, func(completed bool) Disposable {
+				obs.SendCompleted()
+				return nil
+			})
+			bag.Add(disp)
 		})
 	})
 
 }
 
 func (s *Signal) FlatMap(mapping func(value interface{}) *Signal) *Signal {
-	return NewSignal(func(obs Injector) {
-		sig := s
-		sig.ListenNext(func(next interface{}) {
-			sig := mapping(next)
-			sig.LI
-		})
 
-		sig.ListenFailed(func(err error) {
+	return NewSignal(func(obs Injector) {
+		done := make(chan int)
+		count := 0
+		dispMain := s.ListenNext(func(next interface{}) Disposable {
+			mapped := mapping(next)
+			count++
+
+			disp := mapped.Listen(func(v interface{}) Disposable {
+				obs.SendNext(v)
+				return nil
+			}, func(err error) Disposable {
+				obs.SendFailed(err)
+				done <- 0
+				return nil
+			}, func(completed bool) Disposable {
+				count--
+				done <- count
+				return nil
+			})
+			return disp
+		})
+		dispMainFailed := s.ListenFailed(func(err error) Disposable {
 			obs.SendFailed(err)
+			done <- 0
+			return nil
 		})
-		sig.ListenCompleted(func(completed bool) {
-			obs.SendCompleted()
-		})
+		for nbSignalRemain := range done {
+			if nbSignalRemain == 0 {
+				dispMain.Dispose()
+				dispMainFailed.Dispose()
+
+			}
+		}
 	})
 
 }
