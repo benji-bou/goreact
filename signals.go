@@ -18,6 +18,12 @@ type Disposable interface {
 	Dispose()
 }
 
+type DisposableFunc func()
+
+func (df DisposableFunc) Dispose() {
+	df()
+}
+
 type ReusableBagDisposer struct {
 	disposers DisposerList
 	add       chan Disposable
